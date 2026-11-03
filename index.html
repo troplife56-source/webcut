@@ -161,9 +161,10 @@ select{background:var(--panel2);border:1px solid var(--border);border-radius:6px
 <div class="overlay" id="exportOverlay">
   <div class="modal">
     <h3 style="margin:0 0 6px">Export en cours…</h3>
-    <div class="hint">Rendu en temps réel : gardez cet onglet visible jusqu'à la fin.</div>
+    <div class="hint" id="exportStage">Préparation…</div>
     <div class="progress"><div id="exportBar"></div></div>
     <div class="hint" id="exportInfo"></div>
+    <div class="hint" style="margin-top:6px">Gardez cet onglet ouvert : l'export se met en pause si vous changez d'onglet.</div>
     <div style="text-align:right;margin-top:12px"><button class="btn" id="btnCancelExport">Annuler</button></div>
   </div>
 </div>
@@ -742,6 +743,8 @@ class PreviewEngine {
     this.onPlayState?.(false);
   }
   toggle() { this.intent ? this.pause() : this.play(); }
+  /** Reprend la lecture là où elle s'était arrêtée (sans revenir au début en fin de timeline). */
+  resume() { if (this.intent) return; this.intent = true; this.dirty = true; this.onPlayState?.(true); }
   seek(t) {
     this.clock.seek(clamp(Math.round(t), 0, totalDuration()));
     if (this.intent) this.clock.stop();   // on attend que les lecteurs aient rejoint la nouvelle position
@@ -766,6 +769,7 @@ class PreviewEngine {
     if (!this.intent && !this.dirty) return;   // en pause : on ne redessine que si nécessaire
     this.dirty = false;
     const ready = this.render(t);
+    if (ready && this.intent) this.onRendered?.(t);
     if (this.intent) {
       if (ready && !this.clock.running) this.clock.start();
       else if (!ready && this.clock.running) this.clock.stop();
@@ -1536,64 +1540,401 @@ function refreshInspectorInfo() {
 }
 listeners.add(refreshInspectorInfo);
 
-// ---------- Export (MediaRecorder, temps réel) ----------
+// ---------- MP4 : assembleur minimal (ISO BMFF) ----------
+// Produit un MP4 classique (non fragmenté, « faststart » : l'index est au début du fichier),
+// lisible par tous les lecteurs : Windows, macOS, téléphones, réseaux sociaux.
+class Mp4Writer {
+  constructor() { this.tracks = []; this.samples = []; }
+  /** kind : 'video' | 'audio'. codec : 'avc' | 'aac' | 'opus'. */
+  addTrack(t) {
+    const tr = { id: this.tracks.length + 1, entries: [], description: null, ...t };
+    this.tracks.push(tr);
+    return tr;
+  }
+  /** chunk : EncodedVideoChunk / EncodedAudioChunk ; meta : métadonnées du codeur (decoderConfig). */
+  addChunk(tr, chunk, meta) {
+    if (meta && meta.decoderConfig && meta.decoderConfig.description && !tr.description)
+      tr.description = new Uint8Array(meta.decoderConfig.description instanceof ArrayBuffer
+        ? meta.decoderConfig.description : meta.decoderConfig.description.buffer.slice(
+          meta.decoderConfig.description.byteOffset, meta.decoderConfig.description.byteOffset + meta.decoderConfig.description.byteLength));
+    const data = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(data);
+    const s = { tr, data, ts: chunk.timestamp, dur: chunk.duration || 0, key: chunk.type === 'key' };
+    tr.entries.push(s);
+    this.samples.push(s);
+  }
+  finish() {
+    // Échantillons entrelacés par ordre chronologique (meilleure lecture en continu)
+    this.samples.sort((a, b) => a.ts - b.ts || a.tr.id - b.tr.id);
+    let rel = 0;
+    for (const s of this.samples) { s.rel = rel; rel += s.data.byteLength; }
+    const mdatSize = rel + 8;
+    if (mdatSize > 0xffffffff) throw new Error('vidéo trop lourde (4 Go maximum)');
+    for (const tr of this.tracks) this.prepareTrack(tr);
+    const ftyp = box('ftyp', str4('isom'), u32(512), str4('isom'), str4('iso2'), str4('avc1'), str4('mp41'));
+    let moov = this.moov(0);
+    moov = this.moov(ftyp.byteLength + moov.byteLength + 8);   // tailles fixes : 2e passe avec les vrais décalages
+    const parts = [ftyp, moov, u32(mdatSize), str4('mdat')];
+    for (const s of this.samples) parts.push(s.data);
+    return new Blob(parts, { type: 'video/mp4' });
+  }
+  prepareTrack(tr) {
+    const e = tr.entries, ts = tr.timescale;
+    tr.durations = e.map((s, i) => {
+      const next = e[i + 1];
+      const d = next ? next.ts - s.ts : (s.dur || (i ? e[i].ts - e[i - 1].ts : 0));
+      return Math.max(1, Math.round(d * ts / 1e6));
+    });
+    tr.total = tr.durations.reduce((a, b) => a + b, 0);
+  }
+  moov(base) {
+    const movieTs = 1000;
+    const dur = Math.max(...this.tracks.map((t) => Math.round(t.total * movieTs / t.timescale)));
+    const mvhd = fullbox('mvhd', 0, 0, u32(0), u32(0), u32(movieTs), u32(dur), u32(0x00010000), u16(0x0100), zeros(10),
+      MATRIX, zeros(24), u32(this.tracks.length + 1));
+    return box('moov', mvhd, ...this.tracks.map((t) => this.trak(t, base, movieTs, dur)));
+  }
+  trak(tr, base, movieTs) {
+    const video = tr.kind === 'video';
+    const tkDur = Math.round(tr.total * movieTs / tr.timescale);
+    const tkhd = fullbox('tkhd', 0, 3, u32(0), u32(0), u32(tr.id), u32(0), u32(tkDur), zeros(8), u16(0), u16(0),
+      u16(video ? 0 : 0x0100), u16(0), MATRIX, u32(video ? tr.width << 16 : 0), u32(video ? tr.height << 16 : 0));
+    const mdhd = fullbox('mdhd', 0, 0, u32(0), u32(0), u32(tr.timescale), u32(tr.total), u16(0x55c4), u16(0));
+    const hdlr = fullbox('hdlr', 0, 0, u32(0), str4(video ? 'vide' : 'soun'), zeros(12), cstr(video ? 'VideoHandler' : 'SoundHandler'));
+    const xmhd = video ? fullbox('vmhd', 0, 1, zeros(8)) : fullbox('smhd', 0, 0, zeros(4));
+    const dinf = box('dinf', fullbox('dref', 0, 0, u32(1), fullbox('url ', 0, 1)));
+    const e = tr.entries;
+    // stts : durées en plages compressées
+    const runs = [];
+    for (const d of tr.durations) { const r = runs[runs.length - 1]; if (r && r[1] === d) r[0]++; else runs.push([1, d]); }
+    const stts = fullbox('stts', 0, 0, u32(runs.length), ...runs.flatMap(([n, d]) => [u32(n), u32(d)]));
+    const stsc = fullbox('stsc', 0, 0, u32(1), u32(1), u32(1), u32(1));          // 1 échantillon par bloc
+    const stsz = fullbox('stsz', 0, 0, u32(0), u32(e.length), ...e.map((s) => u32(s.data.byteLength)));
+    const stco = fullbox('stco', 0, 0, u32(e.length), ...e.map((s) => u32(base + s.rel)));
+    const stbl = [this.stsd(tr), stts];
+    if (video) {
+      const keys = e.map((s, i) => s.key ? i + 1 : 0).filter(Boolean);
+      stbl.push(fullbox('stss', 0, 0, u32(keys.length), ...keys.map(u32)));
+    }
+    stbl.push(stsc, stsz, stco);
+    return box('trak', tkhd, box('mdia', mdhd, hdlr, box('minf', xmhd, dinf, box('stbl', ...stbl))));
+  }
+  stsd(tr) {
+    let entry;
+    if (tr.codec === 'avc') {
+      if (!tr.description) throw new Error('configuration H.264 manquante');
+      entry = box('avc1', zeros(6), u16(1), zeros(16), u16(tr.width), u16(tr.height), u32(0x00480000), u32(0x00480000),
+        u32(0), u16(1), zeros(32), u16(0x0018), u16(0xffff), box('avcC', tr.description));
+    } else {
+      const head = (type, ...children) => box(type, zeros(6), u16(1), zeros(8), u16(tr.channels), u16(16), u16(0), u16(0),
+        u32((tr.codec === 'opus' ? 48000 : tr.sampleRate) << 16 >>> 0), ...children);
+      if (tr.codec === 'aac') {
+        const asc = tr.description || aacConfig(tr.sampleRate, tr.channels);
+        const dsi = desc(0x05, asc);
+        const dcd = desc(0x04, concat(u8(0x40), u8(0x15), zeros(3), u32(tr.bitrate || 0), u32(tr.bitrate || 0), dsi));
+        const esd = desc(0x03, concat(u16(0), u8(0), dcd, desc(0x06, u8(0x02))));
+        entry = head('mp4a', fullbox('esds', 0, 0, esd));
+      } else {
+        // Opus : « dOps » à partir de l'en-tête OpusHead fourni par le codeur (s'il existe)
+        const d = tr.description;
+        const ok = d && d.byteLength >= 19 && String.fromCharCode(...d.slice(0, 8)) === 'OpusHead';
+        const dv = ok ? new DataView(d.buffer, d.byteOffset, d.byteLength) : null;
+        const preSkip = ok ? dv.getUint16(10, true) : 312;
+        const rate = ok ? dv.getUint32(12, true) : tr.sampleRate;
+        const gain = ok ? dv.getInt16(16, true) : 0;
+        const dops = box('dOps', u8(0), u8(tr.channels), u16(preSkip), u32(rate), u16(gain & 0xffff), u8(0));
+        entry = head('Opus', dops);
+      }
+    }
+    return fullbox('stsd', 0, 0, u32(1), entry);
+  }
+}
+// Petites aides binaires
+const u8 = (v) => new Uint8Array([v & 255]);
+const u16 = (v) => new Uint8Array([(v >> 8) & 255, v & 255]);
+const u32 = (v) => new Uint8Array([(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]);
+const zeros = (n) => new Uint8Array(n);
+const str4 = (s) => new Uint8Array([...s].map((c) => c.charCodeAt(0)));
+const cstr = (s) => new Uint8Array([...new TextEncoder().encode(s), 0]);
+function concat(...parts) {
+  const n = parts.reduce((a, p) => a + p.byteLength, 0), out = new Uint8Array(n);
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.byteLength; }
+  return out;
+}
+const box = (type, ...payload) => { const body = concat(...payload); return concat(u32(body.byteLength + 8), str4(type), body); };
+const fullbox = (type, version, flags, ...payload) => box(type, u8(version), u8(flags >> 16), u8(flags >> 8), u8(flags), ...payload);
+const desc = (tag, body) => concat(u8(tag), u8(0x80), u8(0x80), u8(0x80), u8(body.byteLength), body);
+const MATRIX = concat(...[0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000].map(u32));
+function aacConfig(rate, ch) {
+  const idx = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000].indexOf(rate);
+  return new Uint8Array([(2 << 3) | (idx >> 1), ((idx & 1) << 7) | (ch << 3)]);
+}
+
+// ---------- Export ----------
+// Méthode principale : chaque image est encodée en H.264 avec WebCodecs (horodatée sur la timeline),
+// le son est mixé hors temps réel, puis le tout est assemblé en un vrai MP4 (H.264 + AAC, ou Opus).
+// Méthode de secours (navigateurs sans WebCodecs, ou médias trop lourds) : MediaRecorder.
 let exporting = null;
+const EXPORT_SR = 48000;
+
+function exportFileName(ext) {
+  return `webcut-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`;
+}
+function showExportUI(info) {
+  $('#exportBar').style.width = '0%';
+  $('#exportInfo').textContent = info;
+  $('#exportStage').textContent = 'Préparation…';
+  $('#exportOverlay').classList.add('show');
+}
+function setExportProgress(p, stage) {
+  $('#exportBar').style.width = `${clamp(p * 100, 0, 100)}%`;
+  if (stage) $('#exportStage').textContent = stage;
+}
+function hideExportUI() { $('#exportOverlay').classList.remove('show'); }
+
+/** Vérifie qu'un fichier exporté contient bien une image (et pas seulement du son). */
+function checkVideoBlob(blob) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video'), url = URL.createObjectURL(blob);
+    const done = (ok) => { clearTimeout(to); v.removeAttribute('src'); v.load(); URL.revokeObjectURL(url); resolve(ok); };
+    const to = setTimeout(() => done(null), 6000);            // indéterminé : on ne bloque pas
+    v.muted = true; v.preload = 'metadata';
+    v.onloadedmetadata = () => done(v.videoWidth > 0);
+    v.onerror = () => done(null);
+    v.src = url;
+  });
+}
+async function finishDownload(blob, ext, method, dur) {
+  downloadBlob(blob, exportFileName(ext));
+  const ok = await checkVideoBlob(blob);
+  if (ok === false) toast("Attention : votre navigateur a produit un fichier sans image. Essayez avec Chrome ou Edge à jour.", true, 9000);
+  else toast(`Export terminé : ${(blob.size / 1e6).toFixed(1)} Mo (${ext.toUpperCase()})`);
+  track('export_video', { format: ext, method, duration_s: Math.round(dur / US), aspect: `${state.width}x${state.height}` });
+}
+
+/** Clips qui produisent du son à l'export (mêmes règles que la lecture). */
+function audibleClips() {
+  return Object.values(state.clips).filter((c) => {
+    if (c.type !== 'media' || c.audioDetached) return false;
+    const a = state.assets[c.assetId], tr = trackById(c.trackId);
+    return a && a.kind !== 'image' && a.hasAudio !== false && tr && !tr.muted && (c.volume ?? 1) > 0;
+  });
+}
+
+/** Choisit les codecs ; null si le navigateur ne permet pas l'export MP4 image par image. */
+async function planWebCodecsExport() {
+  if (!window.VideoEncoder || !window.AudioEncoder || !window.VideoFrame || !window.AudioData) return null;
+  // Médias trop lourds pour être décodés en mémoire : on passe par la méthode de secours
+  for (const c of audibleClips()) {
+    const a = state.assets[c.assetId];
+    if (a.size > AUDIO_DECODE_MAX_BYTES || a.duration > AUDIO_DECODE_MAX_DUR) return null;
+  }
+  const W = state.width, H = state.height;
+  const bitrate = Math.round(W * H * FPS * 0.18);          // ≈ 5 Mb/s en 720p
+  let video = null;
+  for (const codec of ['avc1.640028', 'avc1.4d0028', 'avc1.42001f']) {
+    const cfg = { codec, width: W, height: H, bitrate, framerate: FPS, latencyMode: 'quality', avc: { format: 'avc' } };
+    try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) { video = cfg; break; } } catch { /* suivant */ }
+  }
+  if (!video) return null;
+  let audioCfg = null;
+  for (const [codec, kind, br] of [['mp4a.40.2', 'aac', 192000], ['opus', 'opus', 160000]]) {
+    const cfg = { codec, sampleRate: EXPORT_SR, numberOfChannels: 2, bitrate: br };
+    try { if ((await AudioEncoder.isConfigSupported(cfg)).supported) { audioCfg = { cfg, kind }; break; } } catch { /* suivant */ }
+  }
+  if (!audioCfg) return null;
+  return { video, audio: audioCfg };
+}
+
+/** Mixe tout le son de la timeline hors temps réel (volume, vitesse, pistes coupées, son extrait). */
+async function mixTimelineAudio(dur, onProgress) {
+  const len = Math.max(1, Math.ceil(dur / US * EXPORT_SR));
+  const off = new OfflineAudioContext(2, len, EXPORT_SR);
+  const clips = audibleClips(), buffers = new Map();
+  // Limiteur : évite la saturation quand plusieurs sons se superposent
+  const limiter = off.createDynamicsCompressor();
+  limiter.threshold.value = -3; limiter.knee.value = 0; limiter.ratio.value = 20;
+  limiter.attack.value = 0.003; limiter.release.value = 0.25;
+  limiter.connect(off.destination);
+  let i = 0;
+  for (const c of clips) {
+    const a = state.assets[c.assetId];
+    onProgress?.(i++ / Math.max(1, clips.length));
+    if (!buffers.has(a.id)) {
+      try { buffers.set(a.id, await decodeAssetAudio(a)); }
+      catch (e) { if (/piste audio/.test(e.message)) a.hasAudio = false; buffers.set(a.id, null); }
+    }
+    const buf = buffers.get(a.id);
+    if (!buf) continue;
+    const src = off.createBufferSource(), g = off.createGain();
+    src.buffer = buf;
+    src.playbackRate.value = c.speed;
+    g.gain.value = c.volume ?? 1;
+    src.connect(g).connect(limiter);
+    src.start(c.start / US, c.sourceIn / US, (c.sourceOut - c.sourceIn) / US);
+  }
+  buffers.clear();
+  return off.startRendering();
+}
+
 async function exportVideo() {
   const dur = totalDuration();
   if (!dur) { toast('La timeline est vide', true); return; }
-  const canvas = $('#preview');
-  if (!window.MediaRecorder || !canvas.captureStream) { toast("L'export n'est pas supporté par ce navigateur", true); return; }
+  if (exporting) return;
   ensureAudio();
-  const types = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
-  const mimeType = types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
-  const videoTracks = canvas.captureStream(FPS).getVideoTracks();
-  const audioTracks = audio.exportDest ? audio.exportDest.stream.getAudioTracks() : [];
-  const stream = new MediaStream([...videoTracks, ...audioTracks]);
-  let rec;
-  try {
-    rec = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8000000, audioBitsPerSecond: 192000 });
-  } catch (e) { toast(`Export impossible : ${e.message}`, true); return; }
+  exporting = { cancelled: false, dur };
+  showExportUI(`Format : ${state.width}×${state.height} · Durée : ${fmt(dur)}`);
+  let plan = null;
+  try { plan = await planWebCodecsExport(); } catch { plan = null; }
+  if (exporting.cancelled) return endExport();
+  if (plan) {
+    try { await exportWithWebCodecs(plan, dur); }
+    catch (e) {
+      console.error(e);
+      if (!exporting || exporting.cancelled) return endExport();
+      toast(`Export MP4 impossible (${e.message}). Nouvel essai avec la méthode de secours…`, true, 6000);
+      await exportWithRecorder(dur);
+    }
+  } else await exportWithRecorder(dur);
+}
+function endExport(msg) {
+  const was = exporting;
+  if (!was) return null;
+  exporting = null;
+  engine.onEnded = null; engine.onRendered = null;
+  if (engine.playing) engine.pause();
+  hideExportUI();
+  if (msg) toast(msg);
+  return was;
+}
 
-  const chunks = [];
-  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
-  exporting = { rec, cancelled: false, dur };
-  $('#exportBar').style.width = '0%';
-  $('#exportInfo').textContent = `Format : ${mimeType || 'par défaut'} · Durée : ${fmt(dur)}`;
-  $('#exportOverlay').classList.add('show');
+async function exportWithWebCodecs(plan, dur) {
+  const ex = exporting;
+  const mp4 = new Mp4Writer();
+  const W = state.width, H = state.height;
+  const vTrack = mp4.addTrack({ kind: 'video', codec: 'avc', width: W, height: H, timescale: 90000 });
+  const aTrack = mp4.addTrack({ kind: 'audio', codec: plan.audio.kind, channels: 2, sampleRate: EXPORT_SR,
+    timescale: EXPORT_SR, bitrate: plan.audio.cfg.bitrate });
+  let failure = null;
+  const fail = (e) => { failure = failure || e; };
 
+  // 1) Son : mixage hors temps réel puis encodage
+  $('#exportInfo').textContent = `MP4 (H.264 + ${plan.audio.kind === 'aac' ? 'AAC' : 'Opus'}) · ${W}×${H} · ${fmt(dur)}`;
+  setExportProgress(0, 'Préparation du son…');
+  const mix = await mixTimelineAudio(dur, (p) => setExportProgress(p * 0.1));
+  if (ex.cancelled) return endExport('Export annulé');
+  const aenc = new AudioEncoder({ output: (chunk, meta) => mp4.addChunk(aTrack, chunk, meta), error: fail });
+  aenc.configure(plan.audio.cfg);
+  const L = mix.getChannelData(0), R = mix.getChannelData(1), STEP = 4800;
+  for (let s = 0; s < mix.length; s += STEP) {
+    const n = Math.min(STEP, mix.length - s), data = new Float32Array(n * 2);
+    data.set(L.subarray(s, s + n), 0); data.set(R.subarray(s, s + n), n);
+    const ad = new AudioData({ format: 'f32-planar', sampleRate: EXPORT_SR, numberOfFrames: n, numberOfChannels: 2,
+      timestamp: Math.round(s / EXPORT_SR * US), data });
+    aenc.encode(ad); ad.close();
+    if (aenc.encodeQueueSize > 50) await new Promise((r) => aenc.addEventListener('dequeue', r, { once: true }));
+  }
+  await aenc.flush(); aenc.close();
+  if (failure) throw failure;
+  if (ex.cancelled) return endExport('Export annulé');
+
+  // 2) Image : lecture de la timeline, une image encodée tous les 1/30 s de timeline
+  const venc = new VideoEncoder({ output: (chunk, meta) => mp4.addChunk(vTrack, chunk, meta), error: fail });
+  venc.configure(plan.video);
+  const canvas = $('#preview');
+  const total = Math.max(1, Math.ceil(dur / US * FPS));
+  let idx = 0, waitingQueue = false;
+  const frameTs = (i) => Math.round(i * US / FPS);
+  const encodeFrame = () => {
+    const vf = new VideoFrame(canvas, { timestamp: frameTs(idx), duration: frameTs(idx + 1) - frameTs(idx) });
+    venc.encode(vf, { keyFrame: idx % (FPS * 2) === 0 });
+    vf.close();
+    idx++;
+  };
+  const finished = new Promise((resolve) => {
+    engine.onRendered = (t) => {
+      if (ex.cancelled || failure) return;
+      while (idx < total && frameTs(idx) <= t + 1) encodeFrame();
+      setExportProgress(0.1 + 0.88 * idx / total, `Rendu de l'image… ${Math.round(idx / total * 100)} %`);
+      // Encodeur saturé : on met la lecture en pause le temps qu'il rattrape son retard
+      if (venc.encodeQueueSize > 20 && !waitingQueue) {
+        waitingQueue = true; engine.pause();
+        const resume = () => {
+          if (venc.encodeQueueSize > 4 && !ex.cancelled) return venc.addEventListener('dequeue', resume, { once: true });
+          waitingQueue = false; if (!ex.cancelled && !document.hidden) engine.resume();
+        };
+        venc.addEventListener('dequeue', resume, { once: true });
+      }
+    };
+    engine.onEnded = () => {
+      if (ex.cancelled) return resolve();
+      while (idx < total) encodeFrame();      // dernières images (la dernière image reste affichée)
+      resolve();
+    };
+    ex.stop = resolve;
+  });
   engine.pause();
   state.selectedId = null; renderInspector(); timeline.invalidate();
   engine.seek(0);
-  await new Promise((r) => setTimeout(r, 500));     // laisse les lecteurs se positionner
+  if (audio.master) { ex.prevGain = audio.master.gain.value; audio.master.gain.value = 0; }   // export silencieux
+  await new Promise((r) => setTimeout(r, 300));
+  if (!document.hidden) engine.play();
+  await finished;
+  if (audio.master && ex.prevGain != null) audio.master.gain.value = ex.prevGain;
+  engine.onRendered = null; engine.onEnded = null;
+  if (ex.cancelled) { try { venc.close(); } catch { /* déjà fermé */ } return endExport('Export annulé'); }
+  setExportProgress(0.99, 'Finalisation…');
+  await venc.flush(); venc.close();
+  if (failure) throw failure;
+  const blob = mp4.finish();
+  endExport();
+  await finishDownload(blob, 'mp4', 'webcodecs', dur);
+}
 
-  rec.onstop = () => {
-    videoTracks.forEach((t) => t.stop());           // on ne stoppe pas la piste audio (réutilisée)
-    const ok = exporting && !exporting.cancelled;
-    exporting = null;
-    engine.onEnded = null;
-    $('#exportOverlay').classList.remove('show');
-    if (ok && chunks.length) {
-      const type = rec.mimeType || mimeType || 'video/webm';
-      const blob = new Blob(chunks, { type });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `webcut-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${type.includes('mp4') ? 'mp4' : 'webm'}`;
-      document.body.appendChild(link); link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast(`Export terminé (${(blob.size / 1e6).toFixed(1)} Mo)`);
-      track('export_video', { format: type.includes('mp4') ? 'mp4' : 'webm', duration_s: Math.round(dur / US), aspect: `${state.width}x${state.height}` });
-    } else if (!ok) toast('Export annulé');
-  };
+/** Méthode de secours : enregistrement en temps réel du canvas et du son. */
+async function exportWithRecorder(dur) {
+  const ex = exporting || (exporting = { cancelled: false, dur });
+  const canvas = $('#preview');
+  if (!window.MediaRecorder || !canvas.captureStream) { endExport(); toast("L'export n'est pas supporté par ce navigateur", true); return; }
+  // H.264 « High » (le profil Baseline 3.0 est limité à 720×576 et donnait des fichiers sans image)
+  const types = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1.4d0028,mp4a.40.2', 'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+  const mimeType = types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const videoTracks = canvas.captureStream(FPS).getVideoTracks();
+  const audioTracks = audio.exportDest ? audio.exportDest.stream.getAudioTracks() : [];
+  let rec;
+  try { rec = new MediaRecorder(new MediaStream([...videoTracks, ...audioTracks]), { mimeType, videoBitsPerSecond: 8000000, audioBitsPerSecond: 192000 }); }
+  catch (e) { endExport(); toast(`Export impossible : ${e.message}`, true); return; }
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  $('#exportInfo').textContent = `Format : ${mimeType || 'par défaut'} · Durée : ${fmt(dur)} · temps réel`;
+  ex.rec = rec;
+  engine.pause();
+  state.selectedId = null; renderInspector(); timeline.invalidate();
+  engine.seek(0);
+  await new Promise((r) => setTimeout(r, 500));
+  const stopped = new Promise((r) => { rec.onstop = r; });
+  engine.onRendered = (t) => setExportProgress(t / dur, `Enregistrement… ${Math.round(t / dur * 100)} %`);
   engine.onEnded = () => { if (rec.state !== 'inactive') rec.stop(); };
   rec.start(500);
   engine.play();
+  await stopped;
+  videoTracks.forEach((t) => t.stop());
+  const cancelled = ex.cancelled;
+  endExport(cancelled ? 'Export annulé' : null);
+  if (cancelled || !chunks.length) return;
+  const type = rec.mimeType || mimeType || 'video/webm';
+  await finishDownload(new Blob(chunks, { type }), type.includes('mp4') ? 'mp4' : 'webm', 'recorder', dur);
 }
+
 function cancelExport() {
   if (!exporting) return;
   exporting.cancelled = true;
   engine.pause();
-  if (exporting.rec.state !== 'inactive') exporting.rec.stop();
+  if (audio.master && exporting.prevGain != null) audio.master.gain.value = exporting.prevGain;
+  if (exporting.rec && exporting.rec.state !== 'inactive') exporting.rec.stop();
+  exporting.stop?.();
+  if (!exporting.rec && !exporting.stop) endExport('Export annulé');
 }
 
 // ---------- Statistiques ----------
@@ -1673,7 +2014,17 @@ window.addEventListener('drop', (e) => {
 });
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && exporting) toast("L'onglet est masqué : l'export risque d'être figé", true);
+  if (!exporting || exporting.cancelled) return;
+  const rec = exporting.rec;
+  if (document.hidden) {
+    if (engine.playing) { engine.pause(); exporting.hiddenPause = true; }
+    if (rec && rec.state === 'recording') rec.pause();
+  } else if (exporting.hiddenPause) {
+    exporting.hiddenPause = false;
+    if (rec && rec.state === 'paused') rec.resume();
+    engine.resume();
+    toast("Export repris");
+  }
 });
 window.addEventListener('beforeunload', (e) => {
   if (Object.keys(state.clips).length > 0) { e.preventDefault(); e.returnValue = ''; }
